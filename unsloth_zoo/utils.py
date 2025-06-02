@@ -24,8 +24,7 @@ __all__ = [
 
 from packaging.version import Version as TrueVersion
 import torch
-import torch.distributed as dist
-import time
+
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -99,145 +98,86 @@ pass
 #     return result
 # pass
 
-#
 def distributed_function(n=1, function=None, *args, **kwargs):
-    # If we are not in a distributed context yet, just run locally
-    if function is None or not callable(function):
-        raise ValueError("distributed_function requires a callable `func` as its second argument")
+    """
+    Executes a function on rank 0 and broadcasts its result to all other ranks.
+    Args:
+        n (int): Number of objects expected in the list returned by `function` if it returns a list.
+                 If `function` returns a single object, n should be 1.
+        function (callable): The function to execute on rank 0.
+        *args: Positional arguments for `function`.
+        **kwargs: Keyword arguments for `function`.
+    Returns:
+        The result of the function, broadcasted to all ranks.
+    """
+    if torch.distributed.is_initialized():
+        backend = torch.distributed.get_backend()
 
-    # ──────────────────────────
-    # 1. Single-process fallback
-    # ──────────────────────────
-    if not (dist.is_available() and dist.is_initialized()):
-        result = function(*args, **kwargs)
-        return result if n == 1 else tuple(result)
+        object_list_for_broadcast = None  # Initialize to avoid linter warnings
 
-    # ──────────────────────────
-    # 2. Real multi-GPU run
-    # ──────────────────────────
-    rank = dist.get_rank()
-    backend = dist.get_backend()
+        if torch.distributed.get_rank() == 0:
+            # Rank 0 executes the function
+            output_from_function = function(*args, **kwargs)
 
-    # NCCL can only broadcast CUDA tensors → choose device dynamically
-    if backend == "nccl":
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    else:  # gloo, mpi, etc. work with CPU tensors
-        device = torch.device("cpu")
+            if n == 1:
+                # Expecting a single item. Wrap it in a list for broadcast.
+                object_list_for_broadcast = [output_from_function]
+            else:  # n > 1
+                # Expecting 'n' items. 'output_from_function' should be an iterable (list or tuple) of 'n' items.
+                if not isinstance(output_from_function, (list, tuple)):
+                    raise TypeError(
+                        f"Unsloth (distributed_function rank 0): Expected a list or tuple of {n} items "
+                        f"from the wrapped function '{function.__name__}', but got type {type(output_from_function)} "
+                        f"with value: {output_from_function}."
+                    )
 
-    # Rank-0 executes the function
-    if rank == 0:
-        result = function(*args, **kwargs)
-        obj_list = [result] if n == 1 else list(result)
-    else:
-        result = None
-        obj_list = [None] * n
+                # Convert to list for broadcast_object_list and ensure it has 'n' items.
+                object_list_for_broadcast = list(output_from_function)
 
-    # Broadcast the object list so every rank gets rank-0’s result(s)
-    dist.broadcast_object_list(obj_list, src=0, device=device)
+                if len(object_list_for_broadcast) != n:
+                    raise ValueError(
+                        f"Unsloth (distributed_function rank 0): Expected {n} items from the wrapped function "
+                        f"'{function.__name__}', but got {len(object_list_for_broadcast)} items. "
+                        f"Output was: {output_from_function}"
+                    )
+            print(
+                f"[Rank 0 DEBUG] distributed_function: n={n}, type(output_from_function)={type(output_from_function)}, output_from_function={output_from_function}, len(object_list_for_broadcast)={len(object_list_for_broadcast)}, object_list_for_broadcast={object_list_for_broadcast}",
+                flush=True)
+        else:
+            # Other ranks prepare a list of Nones to receive the broadcasted objects
+            object_list_for_broadcast = [None for _ in range(n)]
 
-    # Non-zero ranks pick up the broadcasted value
-    if rank != 0:
-        result = obj_list[0] if n == 1 else tuple(obj_list)
+        # Determine the device for broadcast_object_list
+        if backend == "nccl":
+            # Ensure CUDA is available and initialized for the current process
+            if not torch.cuda.is_available():
+                raise RuntimeError("Unsloth (distributed_function): NCCL backend selected, but CUDA is not available.")
+            if not torch.cuda.is_initialized():  # Should be initialized by DDP setup
+                torch.cuda.init()  # Initialize CUDA for the current process if not already
+            comm_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:  # For "gloo", "mpi", or other backends that might prefer CPU
+            comm_device = torch.device("cpu")
 
-    return result
-pass
+        # Perform the broadcast operation
+        torch.distributed.broadcast_object_list(object_list_for_broadcast, src=0, group=None, device=comm_device)
 
+        # object_list_for_broadcast now contains the results on all ranks.
+        # If n=1, it's like [value]. If n>1, it's like [value1, value2, ...].
 
-# def distributed_function(n=1, function=None, *args, **kwargs):
-#     """
-#     Robust distributed function with compilation support
-#     """
-#     if function is None or not callable(function):
-#         raise ValueError("distributed_function requires a callable `function`")
-#
-#     # Single-process fallback
-#     if not (dist.is_available() and dist.is_initialized()):
-#         result = function(*args, **kwargs)
-#         return result if n == 1 else (result if n > 1 else result)
-#
-#     # Multi-GPU distributed execution with enhanced error handling
-#     rank = dist.get_rank()
-#     world_size = dist.get_world_size()
-#
-#     max_retries = 3
-#     retry_delay = 1.0
-#
-#     for attempt in range(max_retries):
-#         try:
-#             # Synchronize before execution
-#             dist.barrier()
-#
-#             # Only rank 0 executes the function
-#             if rank == 0:
-#                 result = function(*args, **kwargs)
-#                 obj_list = [result] if n == 1 else list(result) if hasattr(result, '__iter__') else [result]
-#
-#                 # Ensure obj_list has correct length
-#                 while len(obj_list) < n:
-#                     obj_list.append(None)
-#                 obj_list = obj_list[:n]
-#             else:
-#                 result = None
-#                 obj_list = [None] * n
-#
-#             # Use CPU tensors for broadcasting to avoid NCCL issues
-#             try:
-#                 # Try NCCL first if available
-#                 if dist.get_backend() == "nccl":
-#                     # For NCCL, we need to be more careful with object broadcasting
-#                     import pickle
-#                     import io
-#
-#                     if rank == 0:
-#                         # Serialize the objects
-#                         buffer = io.BytesIO()
-#                         pickle.dump(obj_list, buffer)
-#                         data = buffer.getvalue()
-#                         size_tensor = torch.tensor([len(data)], dtype=torch.long, device=f"cuda:{rank}")
-#                     else:
-#                         size_tensor = torch.tensor([0], dtype=torch.long, device=f"cuda:{rank}")
-#
-#                     # Broadcast size first
-#                     dist.broadcast(size_tensor, src=0)
-#
-#                     if rank != 0:
-#                         data = bytearray(size_tensor.item())
-#
-#                     # Convert to tensor for broadcasting
-#                     data_tensor = torch.tensor(list(data), dtype=torch.uint8, device=f"cuda:{rank}")
-#                     dist.broadcast(data_tensor, src=0)
-#
-#                     if rank != 0:
-#                         # Deserialize
-#                         buffer = io.BytesIO(bytes(data_tensor.cpu().numpy()))
-#                         obj_list = pickle.load(buffer)
-#                         result = obj_list[0] if n == 1 else tuple(obj_list) if n > 1 else obj_list
-#                 else:
-#                     # Fallback to CPU broadcasting
-#                     dist.broadcast_object_list(obj_list, src=0, device="cpu")
-#                     if rank != 0:
-#                         result = obj_list[0] if n == 1 else tuple(obj_list) if n > 1 else obj_list
-#
-#             except Exception as broadcast_error:
-#                 print(f"Rank {rank}: Broadcast failed: {broadcast_error}, falling back to independent execution")
-#                 # Fallback: each rank executes independently
-#                 result = function(*args, **kwargs)
-#                 return result if n == 1 else (result if n > 1 else result)
-#
-#             # Final synchronization
-#             dist.barrier()
-#             return result
-#
-#         except Exception as e:
-#             print(f"Rank {rank}: Attempt {attempt + 1} failed: {e}")
-#             if attempt < max_retries - 1:
-#                 time.sleep(retry_delay * (attempt + 1))
-#                 continue
-#             else:
-#                 # Final fallback: independent execution
-#                 print(f"Rank {rank}: All attempts failed, executing independently")
-#                 result = function(*args, **kwargs)
-#                 return result if n == 1 else (result if n > 1 else result)
+        if n == 1:
+            final_result = object_list_for_broadcast[0]
+        else:  # n > 1
+            # The caller expects 'n' items, usually for unpacking.
+            # object_list_for_broadcast is already a list of these 'n' items.
+            final_result = object_list_for_broadcast
+
+    else:  # Not in a distributed environment
+        # Execute the function directly. The return structure (single item or tuple/list for n>1)
+        # is determined by the function itself.
+        final_result = function(*args, **kwargs)
+
+    return final_result
+
 
 pass
 # Unsloth Zoo - Utilities for Unsloth

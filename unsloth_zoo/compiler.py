@@ -40,7 +40,6 @@ from .utils import (
     is_distributed,
     distributed_function,
 )
-import torch.distributed as dist
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
@@ -254,6 +253,7 @@ def replace_with_grouped_query_attention(module, source):
 
 pass
 
+
 def _get_compile_folder(use_tempfile=False):
     global UNSLOTH_COMPILE_LOCATION
     global UNSLOTH_COMPILE_USE_TEMP
@@ -285,55 +285,10 @@ def _get_compile_folder(use_tempfile=False):
 pass
 
 
-def _get_compile_folder_distributed(use_tempfile=False):
-    """
-    Distributed-safe compilation folder creation
-    """
-    global UNSLOTH_COMPILE_LOCATION
-    global UNSLOTH_COMPILE_USE_TEMP
-
-    # Get rank safely
-    rank = 0
-    if dist.is_available() and dist.is_initialized():
-        rank = dist.get_rank()
-
-    # Create rank-specific cache directory
-    base_location = UNSLOTH_COMPILE_LOCATION
-    location = f"{base_location}_rank_{rank}"
-
-    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
-        UNSLOTH_COMPILE_USE_TEMP = True
-        location = os.path.join(tempfile.gettempdir(), location)
-
-    # Only create directory if it doesn't exist
-    if not os.path.exists(location):
-        try:
-            os.makedirs(location, exist_ok=True)
-            if rank == 0:
-                print(f"Unsloth: Created compilation cache at `{location}`")
-        except OSError as e:
-            # Handle race conditions
-            if not os.path.exists(location):
-                raise e
-
+def get_compile_folder(use_tempfile=False):
+    location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(2, _get_compile_folder, use_tempfile)
     return location, UNSLOTH_COMPILE_USE_TEMP
 
-
-def get_compile_folder(use_tempfile=False):
-    if dist.is_available() and dist.is_initialized():
-        location, use_temp = _get_compile_folder_distributed(use_tempfile)
-        return location, use_temp
-    else:
-        return _get_compile_folder(use_tempfile)
-
-
-# Replace the original function
-def get_compile_folder_distributed(use_tempfile=False):
-    if dist.is_available() and dist.is_initialized():
-        location, use_temp = _get_compile_folder_distributed(use_tempfile)
-        return location, use_temp
-    else:
-        return _get_compile_folder(use_tempfile)
 
 pass
 
@@ -351,6 +306,13 @@ def create_new_function(
     # All Unsloth Zoo code licensed under LGPLv3
     old_new_source = new_source
     do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        if is_main_process():  # Or just rank == 0 from your setup
+            print(
+                f"[Rank {torch.distributed.get_rank()} DEBUG] Barrier before get_compile_folder in create_new_function for '{name}'",
+                flush=True)
+        torch.distributed.barrier()
 
     if new_source[0] == " ":
         spaces = new_source.find("def")
@@ -406,6 +368,14 @@ def create_new_function(
     # Write function
     global UNSLOTH_COMPILE_USE_TEMP
     file_source = None
+
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        if is_main_process():  # Or just rank == 0 from your setup
+            print(
+                f"[Rank {torch.distributed.get_rank()} DEBUG] Barrier before get_compile_folder in create_new_function for '{name}'",
+                flush=True)
+        torch.distributed.barrier()
+
     compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile=False)
     function_location = os.path.join(compile_folder, f"{name}.py")
 
@@ -439,6 +409,12 @@ def create_new_function(
 
     if overwrite or not os.path.isfile(function_location):
         try:
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                if is_main_process():  # Or just rank == 0 from your setup
+                    print(
+                        f"[Rank {torch.distributed.get_rank()} DEBUG] Barrier before get_compile_folder in create_new_function for '{name}'",
+                        flush=True)
+                torch.distributed.barrier()
             distributed_function(1, write_file, function_location, write_new_source)
         except Exception as error:
             if UNSLOTH_COMPILE_USE_TEMP:
@@ -447,6 +423,12 @@ def create_new_function(
                 # Failed so instead use a temporary directory
                 compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile=True)
                 function_location = os.path.join(compile_folder, f"{name}.py")
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    if is_main_process():  # Or just rank == 0 from your setup
+                        print(
+                            f"[Rank {torch.distributed.get_rank()} DEBUG] Barrier before get_compile_folder in create_new_function for '{name}'",
+                            flush=True)
+                    torch.distributed.barrier()
                 distributed_function(1, write_file, function_location, write_new_source)
             pass
         pass
