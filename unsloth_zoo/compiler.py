@@ -1606,9 +1606,9 @@ def unsloth_compile_transformers(
         "group_fusion": True,
         "disable_progress": not UNSLOTH_ENABLE_LOGGING,
         "verbose_progress": UNSLOTH_ENABLE_LOGGING,
-        "triton.multi_kernel": 0,  # Sometimes fails
+        "triton.multi_kernel": 1,  # Sometimes fails
         "triton.use_block_ptr": False,
-        # "triton.enable_persistent_tma_matmul": True,
+        "triton.enable_persistent_tma_matmul": True,
         "triton.autotune_at_compile_time": True,
     }
 
