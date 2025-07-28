@@ -521,6 +521,12 @@ def create_new_function(
         if not UNSLOTH_COMPILE_USE_TEMP:
             compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile = True)
             function_location = os.path.join(compile_folder, f"{name}.py")
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                if is_main_process():  # Or just rank == 0 from your setup
+                    print(
+                        f"[Rank {torch.distributed.get_rank()} DEBUG] Barrier before get_compile_folder in create_new_function for '{name}'",
+                        flush=True)
+                torch.distributed.barrier()
             distributed_function(1, write_file, function_location, write_new_source)
             if is_main_process():
                 print(f"Standard import failed for {name}: {e}. Using tempfile instead!")
