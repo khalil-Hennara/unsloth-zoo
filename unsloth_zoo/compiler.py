@@ -42,6 +42,7 @@ from .utils import (
     is_distributed,
     distributed_function,
 )
+import torch.distributed as dist
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
@@ -307,6 +308,7 @@ def replace_with_grouped_query_attention(module, source):
     return source
 pass
 
+
 def _get_compile_folder(use_tempfile = False):
     global UNSLOTH_COMPILE_LOCATION
     global UNSLOTH_COMPILE_USE_TEMP
@@ -335,9 +337,44 @@ def _get_compile_folder(use_tempfile = False):
     return location, UNSLOTH_COMPILE_USE_TEMP
 pass
 
-def get_compile_folder(use_tempfile = False):
-    location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(2, _get_compile_folder, use_tempfile)
+
+def _get_compile_folder_distributed(use_tempfile=False):
+    """
+    Distributed-safe compilation folder creation
+    """
+    global UNSLOTH_COMPILE_LOCATION
+    global UNSLOTH_COMPILE_USE_TEMP
+    # Get rank safely
+    rank = 0
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+    # Create rank-specific cache directory
+    base_location = UNSLOTH_COMPILE_LOCATION
+    location = f"{base_location}_rank_{rank}"
+    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
+        UNSLOTH_COMPILE_USE_TEMP = True
+        location = os.path.join(tempfile.gettempdir(), location)
+    # Only create directory if it doesn't exist
+    if not os.path.exists(location):
+        try:
+            os.makedirs(location, exist_ok=True)
+            if rank == 0:
+                print(f"Unsloth: Created compilation cache at `{location}`")
+        except OSError as e:
+            # Handle race conditions
+            if not os.path.exists(location):
+                raise e
     return location, UNSLOTH_COMPILE_USE_TEMP
+
+
+
+def get_compile_folder(use_tempfile=False):
+
+    if dist.is_available() and dist.is_initialized():
+        location, use_temp = _get_compile_folder_distributed(use_tempfile)
+        return location, use_temp
+    else:
+        return _get_compile_folder(use_tempfile)
 pass
 
 # Mask creation functions
