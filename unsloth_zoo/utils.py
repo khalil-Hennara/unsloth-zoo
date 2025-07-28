@@ -75,42 +75,84 @@ pass
 
 
 def distributed_function(n=1, function=None, *args, **kwargs):
-    # If we are not in a distributed context yet, just run locally
-    if function is None or not callable(function):
-        raise ValueError("distributed_function requires a callable `func` as its second argument")
+    """
+    Executes a function on rank 0 and broadcasts its result to all other ranks.
+    Args:
+        n (int): Number of objects expected in the list returned by `function` if it returns a list.
+                 If `function` returns a single object, n should be 1.
+        function (callable): The function to execute on rank 0.
+        *args: Positional arguments for `function`.
+        **kwargs: Keyword arguments for `function`.
+    Returns:
+        The result of the function, broadcasted to all ranks.
+    """
+    if torch.distributed.is_initialized():
+        backend = torch.distributed.get_backend()
 
-    # ──────────────────────────
-    # 1. Single-process fallback
-    # ──────────────────────────
-    if not (dist.is_available() and dist.is_initialized()):
-        result = function(*args, **kwargs)
-        return result if n == 1 else tuple(result)
+        object_list_for_broadcast = None  # Initialize to avoid linter warnings
 
-    # ──────────────────────────
-    # 2. Real multi-GPU run
-    # ──────────────────────────
-    rank = dist.get_rank()
-    backend = dist.get_backend()
-    # NCCL can only broadcast CUDA tensors → choose device dynamically
-    if backend == "nccl":
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    else:  # gloo, mpi, etc. work with CPU tensors
-        device = torch.device("cpu")
+        if torch.distributed.get_rank() == 0:
+            # Rank 0 executes the function
+            output_from_function = function(*args, **kwargs)
 
-    # Rank-0 executes the function
-    if rank == 0:
-        result = function(*args, **kwargs)
-        obj_list = [result] if n == 1 else list(result)
-    else:
-        result = None
-        obj_list = [None] * n
+            if n == 1:
+                # Expecting a single item. Wrap it in a list for broadcast.
+                object_list_for_broadcast = [output_from_function]
+            else:  # n > 1
+                # Expecting 'n' items. 'output_from_function' should be an iterable (list or tuple) of 'n' items.
+                if not isinstance(output_from_function, (list, tuple)):
+                    raise TypeError(
+                        f"Unsloth (distributed_function rank 0): Expected a list or tuple of {n} items "
+                        f"from the wrapped function '{function.__name__}', but got type {type(output_from_function)} "
+                        f"with value: {output_from_function}."
+                    )
 
-    # Broadcast the object list so every rank gets rank-0’s result(s)
-    dist.broadcast_object_list(obj_list, src=0, device=device)
-    # Non-zero ranks pick up the broadcasted value
-    if rank != 0:
-        result = obj_list[0] if n == 1 else tuple(obj_list)
-    return result
+                # Convert to list for broadcast_object_list and ensure it has 'n' items.
+                object_list_for_broadcast = list(output_from_function)
+
+                if len(object_list_for_broadcast) != n:
+                    raise ValueError(
+                        f"Unsloth (distributed_function rank 0): Expected {n} items from the wrapped function "
+                        f"'{function.__name__}', but got {len(object_list_for_broadcast)} items. "
+                        f"Output was: {output_from_function}"
+                    )
+            print(
+                f"[Rank 0 DEBUG] distributed_function: n={n}, type(output_from_function)={type(output_from_function)}, output_from_function={output_from_function}, len(object_list_for_broadcast)={len(object_list_for_broadcast)}, object_list_for_broadcast={object_list_for_broadcast}",
+                flush=True)
+        else:
+            # Other ranks prepare a list of Nones to receive the broadcasted objects
+            object_list_for_broadcast = [None for _ in range(n)]
+
+        # Determine the device for broadcast_object_list
+        if backend == "nccl":
+            # Ensure CUDA is available and initialized for the current process
+            if not torch.cuda.is_available():
+                raise RuntimeError("Unsloth (distributed_function): NCCL backend selected, but CUDA is not available.")
+            if not torch.cuda.is_initialized():  # Should be initialized by DDP setup
+                torch.cuda.init()  # Initialize CUDA for the current process if not already
+            comm_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:  # For "gloo", "mpi", or other backends that might prefer CPU
+            comm_device = torch.device("cpu")
+
+        # Perform the broadcast operation
+        torch.distributed.broadcast_object_list(object_list_for_broadcast, src=0, group=None, device=comm_device)
+
+        # object_list_for_broadcast now contains the results on all ranks.
+        # If n=1, it's like [value]. If n>1, it's like [value1, value2, ...].
+
+        if n == 1:
+            final_result = object_list_for_broadcast[0]
+        else:  # n > 1
+            # The caller expects 'n' items, usually for unpacking.
+            # object_list_for_broadcast is already a list of these 'n' items.
+            final_result = object_list_for_broadcast
+
+    else:  # Not in a distributed environment
+        # Execute the function directly. The return structure (single item or tuple/list for n>1)
+        # is determined by the function itself.
+        final_result = function(*args, **kwargs)
+
+    return final_result
 
 pass
 
